@@ -1,9 +1,9 @@
 # test-daisy-seed
 
-## Author
+## author
 
-<!-- Insert Your Name Here -->
+louis mingot
 
-## Description
+## description
 
-<!-- Describe your example here -->
+m&t hardware pour l'audio - projet test daisy seed
