@@ -9,14 +9,14 @@ using namespace daisysp;
 // ------------------------------------------------------------
 typedef struct
 {
-    float notes[3]; // 3 notes par accord
+    float notes[3];
     int size;
 } Chord;
 
 // ------------------------------------------------------------
 // HORLOGES
 // ------------------------------------------------------------
-uint32_t note_counter = 0;
+uint32_t note_counter  = 0;
 uint32_t chord_counter = 0;
 
 uint32_t samples_per_note  = 0;
@@ -28,19 +28,34 @@ uint32_t samples_per_chord = 0;
 DaisySeed hw;
 
 // ------------------------------------------------------------
+// EFFETS
+// ------------------------------------------------------------
+
+// Delay mélodie
+DelayLine<float, 48000> delay_line;
+float delay_feedback = 0.35f;
+float delay_mix      = 0.25f;
+
+// Filtre SVF mélodie
+Svf melody_filter;
+
+// LFO pour cutoff
+Oscillator lfo;
+
+// Filtre global
+OnePole lp_filter;
+
+// ------------------------------------------------------------
 // OSCILLATEURS & ENVELOPPES
 // ------------------------------------------------------------
 
-// mélodie
+// Mélodie
 Oscillator osc;
 AdEnv env;
 
-// accords (3 oscillateurs)
+// Accords
 Oscillator chord_osc1, chord_osc2, chord_osc3;
 AdEnv chord_env;
-
-// filtre passe-bas global (OnePole)
-OnePole lp_filter;
 
 // ------------------------------------------------------------
 // PROGRESSION D'ACCORDS
@@ -56,48 +71,63 @@ const int chord_count = 3;
 int current_chord = 0;
 
 // ------------------------------------------------------------
-// CALLBACK AUDIO
+// AUDIO CALLBACK
 // ------------------------------------------------------------
 void AudioCallback(AudioHandle::InterleavingInputBuffer in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t size)
 {
-    float melody_volume = 0.03f; // très doux
-    float chord_volume  = 0.08f; // pad planant
+    float melody_volume = 0.05f;
+    float chord_volume  = 0.045f;
 
     for(size_t i = 0; i < size; i += 2)
     {
-        // ---- mélodie ----
-        float sig = osc.Process() * env.Process() * melody_volume;
+        // ================== MÉLODIE ==================
+        float melody = osc.Process() * env.Process();
 
-        // ---- accords ----
-        float chord_sig = chord_osc1.Process() + chord_osc2.Process() + chord_osc3.Process();
+        // LFO -> cutoff
+        float cutoff = 800.0f + lfo.Process() * 600.0f;
+        melody_filter.SetFreq(cutoff);
+
+        melody_filter.Process(melody);
+        melody = melody_filter.Low();
+
+        // delay
+        float delayed = delay_line.Read();
+        delay_line.Write(melody + delayed * delay_feedback);
+
+        melody = melody * (1.0f - delay_mix) + delayed * delay_mix;
+        melody *= melody_volume;
+
+        // ================== ACCORDS ==================
+        float chord_sig =
+            chord_osc1.Process() +
+            chord_osc2.Process() +
+            chord_osc3.Process();
+
         chord_sig *= chord_env.Process() * chord_volume;
 
-        // ---- mix total ----
-        sig += chord_sig;
-
-        // ---- filtre passe-bas global ----
+        // ================== MIX FINAL ==================
+        float sig = melody + chord_sig;
         sig = lp_filter.Process(sig);
 
-        // ---- sortie stéréo ----
-        out[i] = out[i+1] = sig;
+        out[i]     = sig;
+        out[i + 1] = sig;
 
-        // ---- horloge mélodie ----
+        // ================== HORLOGE MÉLODIE ==================
         note_counter++;
         if(note_counter >= samples_per_note)
         {
             note_counter = 0;
-            if(rand() % 100 < 70) // probabilité de jouer
+            if(rand() % 100 < 70)
             {
                 Chord &c = chords[current_chord];
-                int idx = rand() % c.size;
-                osc.SetFreq(c.notes[idx] * 2.0f); // octave supérieure
+                osc.SetFreq(c.notes[rand() % c.size] * 2.0f);
                 env.Trigger();
             }
         }
 
-        // ---- horloge accord ----
+        // ================== HORLOGE ACCORDS ==================
         chord_counter++;
         if(chord_counter >= samples_per_chord)
         {
@@ -105,8 +135,9 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
             current_chord = rand() % chord_count;
 
             chord_osc1.SetFreq(chords[current_chord].notes[0]);
-            chord_osc2.SetFreq(chords[current_chord].notes[1] * 1.005f); // léger désaccord
-            chord_osc3.SetFreq(chords[current_chord].notes[2] * 0.995f); // léger désaccord
+            chord_osc2.SetFreq(chords[current_chord].notes[1] * 1.005f);
+            chord_osc3.SetFreq(chords[current_chord].notes[2] * 0.995f);
+
             chord_env.Trigger();
         }
     }
@@ -117,43 +148,48 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 // ------------------------------------------------------------
 int main(void)
 {
-    // ---- initialisation hardware ----
     hw.Configure();
     hw.Init();
 
     float sr = hw.AudioSampleRate();
-    samples_per_note  = sr * 0.25f; // note toutes les 250 ms
-    samples_per_chord = sr * 4.0f;  // accord toutes les 4 s
+    samples_per_note  = sr * 0.25f;
+    samples_per_chord = sr * 4.0f;
 
-    // ---- mélodie ----
+    // ================== INIT MÉLODIE ==================
     osc.Init(sr);
     osc.SetWaveform(Oscillator::WAVE_SAW);
     osc.SetAmp(1.0f);
 
     env.Init(sr);
-    env.SetTime(ADENV_SEG_ATTACK, 0.5f); // attaque douce
-    env.SetTime(ADENV_SEG_DECAY, 3.0f);  // décroissance longue
+    env.SetTime(ADENV_SEG_ATTACK, 0.5f);
+    env.SetTime(ADENV_SEG_DECAY, 3.0f);
 
-    // ---- accords ----
+    // ================== INIT ACCORDS ==================
     chord_osc1.Init(sr); chord_osc1.SetWaveform(Oscillator::WAVE_SAW);
     chord_osc2.Init(sr); chord_osc2.SetWaveform(Oscillator::WAVE_SAW);
     chord_osc3.Init(sr); chord_osc3.SetWaveform(Oscillator::WAVE_SAW);
 
     chord_env.Init(sr);
-    chord_env.SetTime(ADENV_SEG_ATTACK, 2.0f); // attaque progressive
-    chord_env.SetTime(ADENV_SEG_DECAY, 6.0f);  // tenue longue
+    chord_env.SetTime(ADENV_SEG_ATTACK, 2.0f);
+    chord_env.SetTime(ADENV_SEG_DECAY, 6.0f);
 
-    // ---- filtre passe-bas global OnePole ----
+    // ================== INIT EFFETS ==================
+    delay_line.Init();
+    delay_line.SetDelay(sr * 0.35f);
+
+    melody_filter.Init(sr);
+    melody_filter.SetRes(0.6f);
+
+    lfo.Init(sr);
+    lfo.SetWaveform(Oscillator::WAVE_SIN);
+    lfo.SetFreq(0.15f);
+
     lp_filter.Init();
     lp_filter.SetFilterMode(OnePole::FILTER_MODE_LOW_PASS);
+    lp_filter.SetFrequency(400.0f / sr);
 
-    float fc = 400.0f;
-    lp_filter.SetFrequency(fc/sr);
-
-    // ---- démarrer audio ----
     hw.StartAudio(AudioCallback);
 
-    // ---- boucle infinie ----
     while(1)
     {
         System::Delay(1000);
