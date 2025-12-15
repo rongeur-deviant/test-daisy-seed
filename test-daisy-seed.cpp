@@ -195,16 +195,20 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 
         // ================== horloge drums ==================
         drum_counter++;
+        
+        // hihat sur contretemps (mi-step)
+        if(drum_counter == samples_per_step / 2)
+        {
+            hihat_env.Trigger();
+        }
+
+        // kick sur chaque temps
         if(drum_counter >= samples_per_step)
         {
             drum_counter = 0;
 
             // kick à chaque temps
             kick_env.Trigger();
-
-            // hihat aléatoire
-            if(rand() % 100 < 70)
-                hihat_env.Trigger();
         }
     }
 }
