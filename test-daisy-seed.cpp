@@ -24,6 +24,9 @@ uint32_t samples_per_note  = 0;
 uint32_t samples_per_chord = 0;
 uint32_t samples_per_step  = 0;
 
+// bpm update
+uint32_t bpm_counter = 0;
+
 // ------------------------------------------------------------
 // hardware
 // ------------------------------------------------------------
@@ -32,46 +35,32 @@ DaisySeed hw;
 // ------------------------------------------------------------
 // effets + sidechain
 // ------------------------------------------------------------
-
-// delay mélodie
 DelayLine<float, 48000> delay_line;
 float delay_feedback = 0.35f;
 float delay_mix      = 0.25f;
 
-// filtre svf mélodie
 Svf melody_filter;
-
-// lfo cutoff mélodie
 Oscillator lfo;
-
-// lfo volume accords
 Oscillator chord_lfo;
 float chord_lfo_depth = 0.4f;
 
-// filtre global
 OnePole lp_filter;
 
-// sidechain
 float sidechain_amount = 0.6f;
 float sidechain_env    = 0.0f;
 
 // ------------------------------------------------------------
 // oscillateurs & enveloppes
 // ------------------------------------------------------------
-
-// mélodie
 Oscillator osc;
 AdEnv env;
 
-// accords
 Oscillator chord_osc1, chord_osc2, chord_osc3;
 AdEnv chord_env;
 
-// drums : kick
 Oscillator kick_osc;
 AdEnv kick_env;
 
-// drums : hihat
 WhiteNoise noise;
 Svf hihat_filter;
 AdEnv hihat_env;
@@ -100,8 +89,26 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
     float chord_volume  = 0.045f;
     float drum_volume   = 0.6f;
 
+    float sr = hw.AudioSampleRate();
+
     for(size_t i = 0; i < size; i += 2)
     {
+        // ================== BPM update (toutes les ~10ms) ==================
+        bpm_counter++;
+        if(bpm_counter >= 480)
+        {
+            bpm_counter = 0;
+
+            float pot = hw.adc.GetFloat(0);   // 0 → 1
+            float bpm = 80.0f + pot * 100.0f; // 80 → 180 BPM
+
+            float seconds_per_beat = 60.0f / bpm;
+
+            samples_per_step  = sr * seconds_per_beat;        // noire
+            samples_per_note  = sr * seconds_per_beat * 0.5f; // croche
+            samples_per_chord = sr * seconds_per_beat * 4.0f; // 1 mesure
+        }
+
         // ================== mélodie ==================
         float melody = osc.Process() * env.Process();
 
@@ -116,14 +123,14 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
         melody *= melody_volume;
 
         // ================== sidechain ==================
-        float melody_level = fabsf(melody);
-        float attack  = 0.01f;
+        float level = fabsf(melody);
+        float attack = 0.01f;
         float release = 0.0005f;
 
-        if(melody_level > sidechain_env)
-            sidechain_env += attack * (melody_level - sidechain_env);
+        if(level > sidechain_env)
+            sidechain_env += attack * (level - sidechain_env);
         else
-            sidechain_env += release * (melody_level - sidechain_env);
+            sidechain_env += release * (level - sidechain_env);
 
         float sidechain_gain = 1.0f - sidechain_env * sidechain_amount;
         if(sidechain_gain < 0.0f)
@@ -138,20 +145,17 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
         chord_sig *= chord_env.Process();
 
         float lfo_val = (chord_lfo.Process() + 1.0f) * 0.5f;
-        float modulated_chord_volume =
-            chord_volume * (1.0f - chord_lfo_depth + lfo_val * chord_lfo_depth);
-
-        chord_sig *= modulated_chord_volume * sidechain_gain;
+        chord_sig *= chord_volume *
+                     (1.0f - chord_lfo_depth + lfo_val * chord_lfo_depth) *
+                     sidechain_gain;
 
         // ================== drums ==================
         float drums = 0.0f;
 
-        // kick
         float kick_pitch = 50.0f + kick_env.Process() * 90.0f;
         kick_osc.SetFreq(kick_pitch);
         drums += kick_osc.Process() * kick_env.Process();
 
-        // hihat
         float hh = noise.Process();
         hihat_filter.Process(hh);
         hh = hihat_filter.High();
@@ -195,19 +199,13 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 
         // ================== horloge drums ==================
         drum_counter++;
-        
-        // hihat sur contretemps (mi-step)
-        if(drum_counter == samples_per_step / 2)
-        {
-            hihat_env.Trigger();
-        }
 
-        // kick sur chaque temps
+        if(drum_counter == samples_per_step / 2)
+            hihat_env.Trigger();
+
         if(drum_counter >= samples_per_step)
         {
             drum_counter = 0;
-
-            // kick à chaque temps
             kick_env.Trigger();
         }
     }
@@ -222,9 +220,12 @@ int main(void)
     hw.Init();
 
     float sr = hw.AudioSampleRate();
-    samples_per_note  = sr * 0.25f;
-    samples_per_chord = sr * 4.0f;
-    samples_per_step  = sr * 0.5f; // ~120 bpm
+
+    // ================== ADC ==================
+    AdcChannelConfig adcConfig;
+    adcConfig.InitSingle(hw.GetPin(15));
+    hw.adc.Init(&adcConfig, 1);
+    hw.adc.Start();
 
     // ================== init mélodie ==================
     osc.Init(sr);
@@ -261,7 +262,7 @@ int main(void)
     hihat_env.SetTime(ADENV_SEG_ATTACK, 0.001f);
     hihat_env.SetTime(ADENV_SEG_DECAY, 0.08f);
 
-    // ================== init effets ==================
+    // ================== effets ==================
     delay_line.Init();
     delay_line.SetDelay(sr * 0.35f);
 
@@ -283,7 +284,5 @@ int main(void)
     hw.StartAudio(AudioCallback);
 
     while(1)
-    {
         System::Delay(1000);
-    }
 }
