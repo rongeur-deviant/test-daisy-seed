@@ -4,216 +4,396 @@
 using namespace daisy;
 using namespace daisysp;
 
-// ------------------------------------------------------------
-// structure d'un accord
-// ------------------------------------------------------------
-typedef struct
-{
-    float notes[3];
-    int size;
-} Chord;
+/*
+===============================================================================
+projet : générateur musical autonome avec daisy seed
+-------------------------------------------------------------------------------
+ce script génère en temps réel :
 
-// ------------------------------------------------------------
-// horloges
-// ------------------------------------------------------------
-uint32_t note_counter  = 0;
-uint32_t chord_counter = 0;
-uint32_t drum_counter  = 0;
+- une mélodie aléatoire basée sur une gamme
+- des accords évolutifs
+- une section rythmique (kick / snare / hihat)
+- des effets aléatoires (tremolo, detune, delay)
+- un filtre master contrôlé par potentiomètre
 
-uint32_t samples_per_note  = 0;
+le système fonctionne en audio temps réel via un callback.
+===============================================================================
+*/
+
+
+// ==============================
+// initialisation du hardware
+// ==============================
+
+DaisySeed hw;              // carte daisy seed (accès adc, audio, gpio...)
+Switch scene_button;       // bouton de changement de scène musicale
+bool last_pressed = false; // mémorisation de l'état précédent du bouton
+
+
+// ==============================
+// variables de tempo / horloges
+// ==============================
+
+/*
+le système ne possède pas de "timer musical" classique.
+on utilise donc des compteurs en nombre d'échantillons audio.
+
+comme l'audio est traité sample par sample,
+on peut déclencher des événements musicaux
+en comptant le nombre d'échantillons écoulés.
+*/
+
+uint32_t note_counter = 0;     // déclenchement des notes
+uint32_t chord_counter = 0;    // déclenchement des accords
+uint32_t drum_counter = 0;     // séquence batterie
+uint32_t bpm_counter = 0;      // mise à jour lente du bpm
+
+uint32_t samples_per_note = 0;
 uint32_t samples_per_chord = 0;
-uint32_t samples_per_step  = 0;
+uint32_t samples_per_step = 0;
 
-// bpm update
-uint32_t bpm_counter = 0;
+float bpm_smooth = 110.0f; // bpm lissé pour éviter les changements brusques
 
-// ------------------------------------------------------------
-// hardware
-// ------------------------------------------------------------
-DaisySeed hw;
 
-// ------------------------------------------------------------
-// effets + sidechain
-// ------------------------------------------------------------
-DelayLine<float, 48000> delay_line;
+// ==============================
+// contrôle énergie globale
+// ==============================
+
+/*
+energy agit comme un "volume musical intelligent".
+elle réduit la dynamique globale pour éviter la saturation.
+*/
+
+float energy = 1.0f;
+
+
+// ==============================
+// delay randomisé
+// ==============================
+
+/*
+delay_line est un buffer circulaire.
+on peut lire un ancien échantillon (delay)
+et réécrire dedans avec un feedback.
+*/
+
+bool delay_enabled = false;
 float delay_feedback = 0.35f;
-float delay_mix      = 0.25f;
+float delay_mix = 0.25f;
 
-Svf melody_filter;
-Oscillator lfo;
-Oscillator chord_lfo;
-float chord_lfo_depth = 0.4f;
+DelayLine<float, 48000> delay_line; // 48000 samples max ≈ 1 seconde à 48khz
 
-OnePole lp_filter;
 
-float sidechain_amount = 0.6f;
-float sidechain_env    = 0.0f;
+// ==============================
+// filtre global (pot 2)
+// ==============================
 
-// ------------------------------------------------------------
-// oscillateurs & enveloppes
-// ------------------------------------------------------------
-Oscillator osc;
-AdEnv env;
+/*
+svf = state variable filter
+
+on utilise la sortie passe-bas pour contrôler la brillance globale.
+le potentiomètre 2 agit sur la fréquence de coupure.
+*/
+
+Svf master_filter;
+
+
+// ==============================
+// gestion gamme musicale
+// ==============================
+
+/*
+les gammes sont définies en demi-tons.
+ex : 0 = fondamentale, 7 = quinte, etc.
+*/
+
+float root_freq = 220.0f; // fondamentale
+int* current_scale;       // pointeur vers la gamme active
+int scale_size;           // taille de la gamme
+
+int scale_major[]  = {0,2,4,5,7,9,11};
+int scale_minor[]  = {0,2,3,5,7,8,10};
+int scale_dorian[] = {0,2,3,5,7,9,10};
+int scale_penta[]  = {0,3,5,7,10};
+
+
+// ==============================
+// accords
+// ==============================
+
+/*
+4 accords sont générés.
+chaque accord contient 3 notes (triade).
+*/
+
+float chord_notes[4][3];
+float chord_freq1, chord_freq2, chord_freq3;
+int current_chord = 0;
+
+
+// ==============================
+// patterns batterie
+// ==============================
+
+/*
+chaque pattern contient 4 pas (4/4 simplifié).
+true = déclenchement
+*/
+
+bool kick_pattern[4];
+bool snare_pattern[4];
+bool hihat_pattern[4];
+
+
+// ==============================
+// effets mélodiques
+// ==============================
+
+/*
+fx_lfo = oscillateur basse fréquence utilisé pour le tremolo.
+*/
+
+int melodic_fx_mode = 0;
+Oscillator fx_lfo;
+
+float tremolo_depth = 0.0f;
+float detune_amount = 0.0f;
+
+
+// ==============================
+// oscillateurs mélodie
+// ==============================
+
+Oscillator osc;   // oscillateur principal
+AdEnv env;        // enveloppe attaque/déclin
+
+
+// ==============================
+// oscillateurs accords
+// ==============================
 
 Oscillator chord_osc1, chord_osc2, chord_osc3;
 AdEnv chord_env;
 
+
+// ==============================
+// section batterie
+// ==============================
+
 Oscillator kick_osc;
 AdEnv kick_env;
 
-WhiteNoise noise;
+WhiteNoise noise;      // bruit blanc pour snare & hihat
 Svf hihat_filter;
 AdEnv hihat_env;
+Svf snare_filter;
+AdEnv snare_env;
 
-// ------------------------------------------------------------
-// progression d'accords
-// ------------------------------------------------------------
-Chord chords[] =
+
+// ==============================
+// conversion demi-ton --> fréquence
+// ==============================
+
+float SemiToFreq(float root, int semi)
 {
-    {{220.0f, 261.63f, 329.63f}, 3},
-    {{261.63f, 329.63f, 392.0f}, 3},
-    {{196.0f, 246.94f, 293.66f}, 3}
-};
+    // formule tempérée : f = root * 2^(semi/12)
+    return root * powf(2.0f, semi / 12.0f);
+}
 
-const int chord_count = 3;
-int current_chord = 0;
 
-// ------------------------------------------------------------
-// audio callback
-// ------------------------------------------------------------
+// ==============================
+// génération des accords
+// ==============================
+
+void GenerateChords()
+{
+    /*
+    pour chaque accord :
+    on choisit une note aléatoire dans la gamme
+    puis on construit une triade (note + tierce + quinte)
+    */
+
+    for(int i = 0; i < 4; i++)
+    {
+        int d = rand() % scale_size;
+
+        chord_notes[i][0] = SemiToFreq(root_freq, current_scale[d]);
+        chord_notes[i][1] = SemiToFreq(root_freq, current_scale[(d+2)%scale_size]);
+        chord_notes[i][2] = SemiToFreq(root_freq, current_scale[(d+4)%scale_size]);
+    }
+}
+
+
+// ==============================
+// génération pattern batterie
+// ==============================
+
+void GenerateDrumPattern()
+{
+    /*
+    génération semi-aléatoire avec probabilités fixes.
+    */
+
+    for(int i=0;i<4;i++)
+    {
+        kick_pattern[i]  = (rand()%100 < 60);
+        snare_pattern[i] = (rand()%100 < 50);
+        hihat_pattern[i] = (rand()%100 < 70);
+    }
+
+    // structure minimale stable
+    kick_pattern[0] = true;
+    snare_pattern[2] = true;
+}
+
+
+// ==============================
+// randomisation complète d'une scène
+// ==============================
+
+void RandomizeScene()
+{
+    /*
+    change :
+    - fondamentale
+    - gamme
+    - accords
+    - pattern batterie
+    - effets
+    */
+
+    float roots[] = {110,130.81f,146.83f,174.61f,196};
+    root_freq = roots[rand()%5];
+
+    int sc = rand()%4;
+    if(sc==0){ current_scale=scale_major; scale_size=7; }
+    if(sc==1){ current_scale=scale_minor; scale_size=7; }
+    if(sc==2){ current_scale=scale_dorian; scale_size=7; }
+    if(sc==3){ current_scale=scale_penta; scale_size=5; }
+
+    GenerateChords();
+    GenerateDrumPattern();
+
+    melodic_fx_mode = rand()%2;
+
+    tremolo_depth = 0.2f + (rand()%30)/100.0f;
+
+    delay_enabled = (rand()%2);
+}
+
+
+// ==============================
+// callback audio (coeur du système)
+// ==============================
+
 void AudioCallback(AudioHandle::InterleavingInputBuffer in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t size)
 {
-    float melody_volume = 0.05f;
-    float chord_volume  = 0.045f;
-    float drum_volume   = 0.6f;
-
     float sr = hw.AudioSampleRate();
 
-    for(size_t i = 0; i < size; i += 2)
+    /*
+    cette fonction est appelée en boucle par le hardware audio.
+    elle doit être ultra rapide.
+    */
+
+    for(size_t i=0;i<size;i+=2)
     {
-        // ================== BPM update (toutes les ~10ms) ==================
-        bpm_counter++;
-        if(bpm_counter >= 480)
-        {
-            bpm_counter = 0;
+        // gestion bouton scène
+        scene_button.Debounce();
+        bool pressed = scene_button.Pressed();
+        if(pressed && !last_pressed)
+            RandomizeScene();
+        last_pressed = pressed;
 
-            float pot = hw.adc.GetFloat(0);   // 0 → 1
-            float bpm = 80.0f + pot * 100.0f; // 80 → 180 BPM
+        // lecture des potentiomètres
+        float pot_bpm    = hw.adc.GetFloat(0);
+        float pot_filter = hw.adc.GetFloat(1);
+        float pot_energy = hw.adc.GetFloat(2);
 
-            float seconds_per_beat = 60.0f / bpm;
+        // calcul bpm
+        float target = 40 + pot_bpm*75;
+        bpm_smooth = 0.95f*bpm_smooth + 0.05f*target;
 
-            samples_per_step  = sr * seconds_per_beat;        // noire
-            samples_per_note  = sr * seconds_per_beat * 0.5f; // croche
-            samples_per_chord = sr * seconds_per_beat * 4.0f; // 1 mesure
-        }
+        energy = 0.1f + pot_energy * 0.5f;
 
-        // ================== mélodie ==================
-        float melody = osc.Process() * env.Process();
+        float seconds = 60.0f/bpm_smooth;
 
-        float cutoff = 800.0f + lfo.Process() * 600.0f;
-        melody_filter.SetFreq(cutoff);
-        melody_filter.Process(melody);
-        melody = melody_filter.Low();
+        samples_per_note  = sr*seconds*0.5f;
+        samples_per_chord = sr*seconds*4.0f;
 
-        float delayed = delay_line.Read();
-        delay_line.Write(melody + delayed * delay_feedback);
-        melody = melody * (1.0f - delay_mix) + delayed * delay_mix;
-        melody *= melody_volume;
+        master_filter.SetFreq(200.0f + pot_filter*6000.0f);
+        master_filter.SetRes(0.7f);
 
-        // ================== sidechain ==================
-        float level = fabsf(melody);
-        float attack = 0.01f;
-        float release = 0.0005f;
+        // -------- génération mélodie --------
+        float melody = osc.Process()*env.Process()*0.5f;
 
-        if(level > sidechain_env)
-            sidechain_env += attack * (level - sidechain_env);
-        else
-            sidechain_env += release * (level - sidechain_env);
-
-        float sidechain_gain = 1.0f - sidechain_env * sidechain_amount;
-        if(sidechain_gain < 0.0f)
-            sidechain_gain = 0.0f;
-
-        // ================== accords ==================
+        // -------- génération accords --------
         float chord_sig =
-            chord_osc1.Process() +
-            chord_osc2.Process() +
+            chord_osc1.Process()+
+            chord_osc2.Process()+
             chord_osc3.Process();
 
-        chord_sig *= chord_env.Process();
+        chord_sig *= chord_env.Process()*0.4f;
 
-        float lfo_val = (chord_lfo.Process() + 1.0f) * 0.5f;
-        chord_sig *= chord_volume *
-                     (1.0f - chord_lfo_depth + lfo_val * chord_lfo_depth) *
-                     sidechain_gain;
+        float melodic = melody + chord_sig;
 
-        // ================== drums ==================
+        // -------- effet tremolo --------
+        if(melodic_fx_mode==0)
+        {
+            float l = (fx_lfo.Process()+1)*0.5f;
+            melodic *= (1.0f - tremolo_depth + l*tremolo_depth);
+        }
+
+        // -------- effet delay --------
+        if(delay_enabled)
+        {
+            float delayed = delay_line.Read();
+            delay_line.Write(melodic + delayed*delay_feedback);
+            melodic = melodic*(1.0f-delay_mix) + delayed*delay_mix;
+        }
+
+        // -------- batterie --------
         float drums = 0.0f;
 
-        float kick_pitch = 50.0f + kick_env.Process() * 90.0f;
-        kick_osc.SetFreq(kick_pitch);
-        drums += kick_osc.Process() * kick_env.Process();
+        kick_osc.SetFreq(50 + kick_env.Process()*90);
+        drums += kick_osc.Process()*kick_env.Process();
 
-        float hh = noise.Process();
-        hihat_filter.Process(hh);
-        hh = hihat_filter.High();
-        drums += hh * hihat_env.Process() * 0.3f;
+        snare_filter.Process(noise.Process());
+        drums += snare_filter.Band()*snare_env.Process()*0.6f;
 
-        drums *= drum_volume;
+        hihat_filter.Process(noise.Process());
+        drums += hihat_filter.High()*hihat_env.Process()*0.3f;
 
-        // ================== mix final ==================
-        float sig = melody + chord_sig + drums;
-        sig = lp_filter.Process(sig);
+        float sig = melodic + drums;
 
-        out[i]     = sig;
-        out[i + 1] = sig;
+        // -------- filtre master --------
+        master_filter.Process(sig);
+        sig = master_filter.Low();
 
-        // ================== horloge mélodie ==================
+        // -------- saturation douce --------
+        sig *= energy;
+        sig = tanhf(sig*1.5f);
+
+        out[i]=sig;
+        out[i+1]=sig;
+
+        // -------- déclenchement notes --------
         note_counter++;
-        if(note_counter >= samples_per_note)
+        if(note_counter>=samples_per_note)
         {
-            note_counter = 0;
-            if(rand() % 100 < 70)
-            {
-                Chord &c = chords[current_chord];
-                osc.SetFreq(c.notes[rand() % c.size] * 2.0f);
-                env.Trigger();
-            }
-        }
-
-        // ================== horloge accords ==================
-        chord_counter++;
-        if(chord_counter >= samples_per_chord)
-        {
-            chord_counter = 0;
-            current_chord = rand() % chord_count;
-
-            chord_osc1.SetFreq(chords[current_chord].notes[0]);
-            chord_osc2.SetFreq(chords[current_chord].notes[1] * 1.005f);
-            chord_osc3.SetFreq(chords[current_chord].notes[2] * 0.995f);
-
-            chord_env.Trigger();
-        }
-
-        // ================== horloge drums ==================
-        drum_counter++;
-
-        if(drum_counter == samples_per_step / 2)
-            hihat_env.Trigger();
-
-        if(drum_counter >= samples_per_step)
-        {
-            drum_counter = 0;
-            kick_env.Trigger();
+            note_counter=0;
+            osc.SetFreq(SemiToFreq(root_freq,current_scale[rand()%scale_size])*2);
+            env.Trigger();
         }
     }
 }
 
-// ------------------------------------------------------------
+
+// ==============================
 // main
-// ------------------------------------------------------------
+// ==============================
+
 int main(void)
 {
     hw.Configure();
@@ -221,68 +401,45 @@ int main(void)
 
     float sr = hw.AudioSampleRate();
 
-    // ================== ADC ==================
-    AdcChannelConfig adcConfig;
-    adcConfig.InitSingle(hw.GetPin(15));
-    hw.adc.Init(&adcConfig, 1);
+    scene_button.Init(hw.GetPin(28),1000);
+
+    AdcChannelConfig adc[3];
+    adc[0].InitSingle(hw.GetPin(15));
+    adc[1].InitSingle(hw.GetPin(16));
+    adc[2].InitSingle(hw.GetPin(17));
+
+    hw.adc.Init(adc,3);
     hw.adc.Start();
 
-    // ================== init mélodie ==================
     osc.Init(sr);
-    osc.SetWaveform(Oscillator::WAVE_SAW);
-
     env.Init(sr);
-    env.SetTime(ADENV_SEG_ATTACK, 0.5f);
-    env.SetTime(ADENV_SEG_DECAY, 3.0f);
 
-    // ================== init accords ==================
-    chord_osc1.Init(sr); chord_osc1.SetWaveform(Oscillator::WAVE_SAW);
-    chord_osc2.Init(sr); chord_osc2.SetWaveform(Oscillator::WAVE_SAW);
-    chord_osc3.Init(sr); chord_osc3.SetWaveform(Oscillator::WAVE_SAW);
-
+    chord_osc1.Init(sr);
+    chord_osc2.Init(sr);
+    chord_osc3.Init(sr);
     chord_env.Init(sr);
-    chord_env.SetTime(ADENV_SEG_ATTACK, 2.0f);
-    chord_env.SetTime(ADENV_SEG_DECAY, 6.0f);
 
-    // ================== init drums ==================
     kick_osc.Init(sr);
-    kick_osc.SetWaveform(Oscillator::WAVE_SIN);
-
     kick_env.Init(sr);
-    kick_env.SetTime(ADENV_SEG_ATTACK, 0.001f);
-    kick_env.SetTime(ADENV_SEG_DECAY, 0.25f);
 
+    snare_env.Init(sr);
     noise.Init();
 
     hihat_filter.Init(sr);
-    hihat_filter.SetFreq(8000.0f);
-    hihat_filter.SetRes(0.7f);
-
     hihat_env.Init(sr);
-    hihat_env.SetTime(ADENV_SEG_ATTACK, 0.001f);
-    hihat_env.SetTime(ADENV_SEG_DECAY, 0.08f);
 
-    // ================== effets ==================
     delay_line.Init();
-    delay_line.SetDelay(sr * 0.35f);
+    delay_line.SetDelay(sr*0.35f);
 
-    melody_filter.Init(sr);
-    melody_filter.SetRes(0.6f);
+    master_filter.Init(sr);
 
-    lfo.Init(sr);
-    lfo.SetWaveform(Oscillator::WAVE_SIN);
-    lfo.SetFreq(0.15f);
+    fx_lfo.Init(sr);
+    fx_lfo.SetWaveform(Oscillator::WAVE_SIN);
 
-    chord_lfo.Init(sr);
-    chord_lfo.SetWaveform(Oscillator::WAVE_SIN);
-    chord_lfo.SetFreq(0.03f);
-
-    lp_filter.Init();
-    lp_filter.SetFilterMode(OnePole::FILTER_MODE_LOW_PASS);
-    lp_filter.SetFrequency(400.0f / sr);
+    RandomizeScene(); // initialise une première scène
 
     hw.StartAudio(AudioCallback);
 
     while(1)
-        System::Delay(1000);
+        System::Delay(1);
 }
